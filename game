@@ -1,0 +1,432 @@
+// OneFileFortnitePrototype.cs
+// Drop this single file into Assets/. Add components to scene per Setup notes at bottom.
+
+using UnityEngine;
+using System.Collections;
+
+#region Player + Camera
+
+[RequireComponent(typeof(CharacterController))]
+public class PlayerController : MonoBehaviour
+{
+    [Header("Movement")]
+    public float moveSpeed = 6f;
+    public float sprintMultiplier = 1.5f;
+    public float jumpHeight = 1.2f;
+    public float gravity = -20f;
+
+    [Header("Look")]
+    public Transform cameraPivot;
+    public float turnSmoothTime = 0.07f;
+
+    CharacterController cc;
+    Vector3 velocity;
+    float turnSmoothVelocity;
+
+    void Awake()
+    {
+        cc = GetComponent<CharacterController>();
+        if (Cursor.lockState != CursorLockMode.Locked)
+        {
+            Cursor.lockState = CursorLockMode.Locked;
+            Cursor.visible = false;
+        }
+    }
+
+    void Update()
+    {
+        HandleMovement();
+        ApplyGravity();
+    }
+
+    void HandleMovement()
+    {
+        float h = Input.GetAxisRaw("Horizontal");
+        float v = Input.GetAxisRaw("Vertical");
+        Vector3 inputDir = new Vector3(h, 0f, v).normalized;
+
+        float speed = moveSpeed * (Input.GetKey(KeyCode.LeftShift) ? sprintMultiplier : 1f);
+
+        if (inputDir.magnitude >= 0.1f)
+        {
+            float targetAngle = Mathf.Atan2(inputDir.x, inputDir.z) * Mathf.Rad2Deg + cameraPivot.eulerAngles.y;
+            float angle = Mathf.SmoothDampAngle(transform.eulerAngles.y, targetAngle, ref turnSmoothVelocity, turnSmoothTime);
+            transform.rotation = Quaternion.Euler(0f, angle, 0f);
+
+            Vector3 moveDir = Quaternion.Euler(0f, targetAngle, 0f) * Vector3.forward;
+            cc.Move(moveDir.normalized * speed * Time.deltaTime);
+        }
+
+        if (cc.isGrounded && Input.GetButtonDown("Jump"))
+        {
+            velocity.y = Mathf.Sqrt(-2f * gravity * jumpHeight);
+        }
+    }
+
+    void ApplyGravity()
+    {
+        if (cc.isGrounded && velocity.y < 0f) velocity.y = -2f;
+        velocity.y += gravity * Time.deltaTime;
+        cc.Move(velocity * Time.deltaTime);
+    }
+}
+
+public class ThirdPersonCamera : MonoBehaviour
+{
+    [Header("Targets")]
+    public Transform target;        // Player
+    public Transform cam;           // Main Camera
+
+    [Header("Orbit")]
+    public Vector2 sensitivity = new Vector2(200f, 120f);
+    public Vector2 pitchLimits = new Vector2(-30f, 70f);
+    public float followDistance = 3.5f;
+    public float followHeight = 1.6f;
+
+    [Header("Collision")]
+    public float collisionRadius = 0.2f;
+    public LayerMask collisionMask;
+
+    float yaw, pitch;
+
+    void Start()
+    {
+        Vector3 e = transform.eulerAngles;
+        yaw = e.y; pitch = e.x;
+    }
+
+    void LateUpdate()
+    {
+        if (!target || !cam) return;
+
+        yaw += Input.GetAxis("Mouse X") * sensitivity.x * Time.deltaTime;
+        pitch -= Input.GetAxis("Mouse Y") * sensitivity.y * Time.deltaTime;
+        pitch = Mathf.Clamp(pitch, pitchLimits.x, pitchLimits.y);
+
+        transform.position = target.position + Vector3.up * followHeight;
+        transform.rotation = Quaternion.Euler(pitch, yaw, 0f);
+
+        Vector3 desiredPos = transform.position - transform.forward * followDistance;
+        if (Physics.SphereCast(transform.position, collisionRadius, -transform.forward, out RaycastHit hit, followDistance, collisionMask))
+            desiredPos = hit.point + transform.forward * 0.2f;
+
+        cam.position = desiredPos;
+        cam.rotation = transform.rotation;
+    }
+}
+
+#endregion
+
+#region Health + Combat
+
+public class Health : MonoBehaviour
+{
+    public float maxHP = 100f;
+    public float currentHP;
+
+    public System.Action<float, float> OnHealthChanged;
+    public System.Action OnDeath;
+
+    void Awake() => currentHP = maxHP;
+
+    public void Damage(float amount)
+    {
+        if (currentHP <= 0f) return;
+        currentHP = Mathf.Max(0f, currentHP - amount);
+        OnHealthChanged?.Invoke(currentHP, maxHP);
+        if (currentHP <= 0f) OnDeath?.Invoke();
+    }
+}
+
+public class Projectile : MonoBehaviour
+{
+    public float speed = 60f;
+    public float lifeTime = 3f;
+    public float damage = 25f;
+    public LayerMask hitMask;
+
+    float t;
+
+    void Update()
+    {
+        float step = speed * Time.deltaTime;
+
+        if (Physics.Raycast(transform.position, transform.forward, out RaycastHit hit, step + 0.2f, hitMask))
+        {
+            if (hit.collider.TryGetComponent<Health>(out var hp)) hp.Damage(damage);
+            Destroy(gameObject);
+            return;
+        }
+
+        transform.position += transform.forward * step;
+
+        t += Time.deltaTime;
+        if (t >= lifeTime) Destroy(gameObject);
+    }
+}
+
+public class Weapon : MonoBehaviour
+{
+    [Header("Refs")]
+    public Transform muzzle;
+    public GameObject projectilePrefab;
+
+    [Header("Firing")]
+    public float fireRate = 8f; // rps
+    public float spreadDegrees = 1.5f;
+
+    [Header("Ammo")]
+    public int magSize = 30;
+    public int ammo;
+    public float reloadTime = 2f;
+
+    float nextFire;
+    bool reloading;
+
+    void Awake()
+    {
+        ammo = magSize;
+    }
+
+    void Update()
+    {
+        if (!muzzle || !projectilePrefab) return;
+        if (reloading) return;
+
+        if (Input.GetMouseButton(0) && Time.time >= nextFire && ammo > 0)
+        {
+            Shoot();
+            nextFire = Time.time + 1f / fireRate;
+        }
+
+        if (ammo <= 0 || Input.GetKeyDown(KeyCode.R))
+            StartCoroutine(Reload());
+    }
+
+    void Shoot()
+    {
+        ammo--;
+        Quaternion spread = Quaternion.Euler(
+            Random.Range(-spreadDegrees, spreadDegrees),
+            Random.Range(-spreadDegrees, spreadDegrees),
+            0f
+        );
+        Instantiate(projectilePrefab, muzzle.position, muzzle.rotation * spread);
+    }
+
+    IEnumerator Reload()
+    {
+        reloading = true;
+        yield return new WaitForSeconds(reloadTime);
+        ammo = magSize;
+        reloading = false;
+    }
+}
+
+#endregion
+
+#region Building
+
+public class Builder : MonoBehaviour
+{
+    [System.Serializable]
+    public class BuildPiece { public string id; public GameObject prefab; public Vector3 size = new Vector3(3f,3f,0.2f); }
+
+    [Header("Refs")]
+    public Transform cameraPivot;
+
+    [Header("Masks")]
+    public LayerMask groundMask;
+    public LayerMask blockMask;
+
+    [Header("Config")]
+    public float maxBuildDistance = 10f;
+    public float gridSize = 0.5f;
+    public Material previewValidMat;
+    public Material previewInvalidMat;
+    public BuildPiece[] pieces;
+
+    int currentIndex;
+    GameObject preview;
+
+    void Start()
+    {
+        if (pieces != null && pieces.Length > 0) SetPiece(0);
+    }
+
+    void Update()
+    {
+        if (pieces == null || pieces.Length == 0) return;
+
+        // Cycle pieces via number keys 1..N
+        for (int i = 0; i < pieces.Length && i < 9; i++)
+            if (Input.GetKeyDown(KeyCode.Alpha1 + i)) SetPiece(i);
+
+        UpdatePreview();
+
+        if (preview != null && Input.GetMouseButtonDown(0))
+        {
+            if (IsValidPlacement(out Vector3 placePos, out Quaternion rot))
+                Instantiate(pieces[currentIndex].prefab, placePos, rot);
+        }
+
+        if (preview != null)
+        {
+            if (Input.GetKeyDown(KeyCode.Q)) preview.transform.Rotate(Vector3.up, -90f);
+            if (Input.GetKeyDown(KeyCode.E)) preview.transform.Rotate(Vector3.up, 90f);
+        }
+    }
+
+    void SetPiece(int index)
+    {
+        currentIndex = Mathf.Clamp(index, 0, pieces.Length - 1);
+        if (preview != null) Destroy(preview);
+        preview = Instantiate(pieces[currentIndex].prefab);
+        foreach (var r in preview.GetComponentsInChildren<Renderer>()) r.sharedMaterial = previewValidMat;
+        foreach (var c in preview.GetComponentsInChildren<Collider>()) c.enabled = false; // ghost
+    }
+
+    void UpdatePreview()
+    {
+        if (!preview || !cameraPivot) return;
+
+        Vector3 aimOrigin = cameraPivot.position;
+        Vector3 aimDir = cameraPivot.forward;
+
+        Vector3 targetPos = aimOrigin + aimDir * maxBuildDistance;
+        if (Physics.Raycast(aimOrigin, aimDir, out RaycastHit hit, maxBuildDistance, groundMask | blockMask))
+            targetPos = hit.point;
+
+        Vector3 snapped = SnapToGrid(targetPos);
+        preview.transform.position = snapped;
+
+        bool valid = IsValidPlacement(out _, out _);
+        SetPreviewValid(valid);
+    }
+
+    Vector3 SnapToGrid(Vector3 p)
+    {
+        float Snap(float v) => Mathf.Round(v / gridSize) * gridSize;
+        return new Vector3(Snap(p.x), Snap(p.y), Snap(p.z));
+    }
+
+    bool IsValidPlacement(out Vector3 placePos, out Quaternion rot)
+    {
+        placePos = preview.transform.position;
+        rot = preview.transform.rotation;
+
+        var bounds = new Bounds(placePos, pieces[currentIndex].size);
+        Collider[] hits = Physics.OverlapBox(bounds.center, bounds.extents, rot, blockMask, QueryTriggerInteraction.Ignore);
+        return hits.Length == 0;
+    }
+
+    void SetPreviewValid(bool valid)
+    {
+        foreach (var r in preview.GetComponentsInChildren<Renderer>())
+            r.sharedMaterial = valid ? previewValidMat : previewInvalidMat;
+    }
+
+    void OnDrawGizmosSelected()
+    {
+        if (!preview || pieces == null || pieces.Length == 0) return;
+        Gizmos.color = Color.cyan;
+        Gizmos.DrawWireCube(preview.transform.position, pieces[currentIndex].size);
+    }
+}
+
+#endregion
+
+#region Game loop / Storm
+
+public class GameManager : MonoBehaviour
+{
+    [Header("Storm")]
+    public Transform stormCenter;
+    public float startRadius = 100f;
+    public float endRadius = 10f;
+    public float shrinkDuration = 300f; // seconds
+    public float stormDPS = 5f;
+    public LayerMask playerMask;
+
+    float t;
+
+    void Update()
+    {
+        if (!stormCenter) return;
+
+        t += Time.deltaTime;
+        float r = Mathf.Lerp(startRadius, endRadius, Mathf.Clamp01(t / shrinkDuration));
+        DrawCircle(stormCenter.position, r, Color.blue);
+
+        // Damage players outside safe zone
+        Collider[] playersInStart = Physics.OverlapSphere(stormCenter.position, startRadius, playerMask, QueryTriggerInteraction.Collide);
+        foreach (var p in playersInStart)
+        {
+            float dist = Vector3.Distance(stormCenter.position, p.transform.position);
+            if (dist > r && p.TryGetComponent<Health>(out var hp))
+                hp.Damage(stormDPS * Time.deltaTime);
+        }
+    }
+
+    void DrawCircle(Vector3 center, float radius, Color color)
+    {
+        int seg = 96;
+        for (int i = 0; i < seg; i++)
+        {
+            float a0 = (i / (float)seg) * Mathf.PI * 2f;
+            float a1 = ((i + 1) / (float)seg) * Mathf.PI * 2f;
+            Vector3 p0 = center + new Vector3(Mathf.Cos(a0), 0, Mathf.Sin(a0)) * radius;
+            Vector3 p1 = center + new Vector3(Mathf.Cos(a1), 0, Mathf.Sin(a1)) * radius;
+            Debug.DrawLine(p0, p1, color);
+        }
+    }
+}
+
+#endregion
+
+#region Minimal helper to auto-wire a basic test scene (optional)
+
+public class QuickSceneBootstrap : MonoBehaviour
+{
+    [Header("Layers")]
+    public string groundLayerName = "Ground";
+    public string buildLayerName = "Buildable";
+    public string playerLayerName = "Player";
+
+    [Header("Prefabs generated at runtime")]
+    public Material previewValidMat;
+    public Material previewInvalidMat;
+    public GameObject projectilePrefab;
+
+    void Start()
+    {
+        // Create simple projectile prefab if not assigned
+        if (!projectilePrefab)
+        {
+            var go = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+            go.transform.localScale = Vector3.one * 0.1f;
+            Destroy(go.GetComponent<Collider>());
+            var proj = go.AddComponent<Projectile>();
+            proj.speed = 60f;
+            proj.damage = 25f;
+            projectilePrefab = go;
+            go.SetActive(false);
+        }
+
+        // Materials
+        if (!previewValidMat)
+        {
+            previewValidMat = new Material(Shader.Find("Standard"));
+            var c = Color.green; c.a = 0.4f;
+            previewValidMat.color = c;
+        }
+        if (!previewInvalidMat)
+        {
+            previewInvalidMat = new Material(Shader.Find("Standard"));
+            var c = Color.red; c.a = 0.4f;
+            previewInvalidMat.color = c;
+        }
+    }
+}
+
+#endregion
